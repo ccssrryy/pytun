@@ -1,6 +1,9 @@
 from setuptools import setup, Extension
+import sys
 
-setup(name='python-pytun',
+platform = sys.platform
+
+setup(name='pytun',
       author='montag451',
       author_email='montag451@laposte.net',
       maintainer='montag451',
@@ -9,7 +12,9 @@ setup(name='python-pytun',
       description='Linux TUN/TAP wrapper for Python',
       long_description=open('README.rst').read(),
       version='2.3.0',
-      ext_modules=[Extension('pytun', ['pytun.c'])],
+      ext_modules=[Extension('pytun', ['pytun.c'], define_macros=[('PLATFORM_LINUX', str(int(platform=="linux"))),
+                     ('PLATFORM_DARWIN', str(int(platform=="darwin")))],)],
+
       classifiers=[
           'Development Status :: 5 - Production/Stable',
           'Intended Audience :: Developers',

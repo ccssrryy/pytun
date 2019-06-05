@@ -10,7 +10,13 @@
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <net/ethernet.h>
+#ifndef PLATFORM_DARWIN
 #include <linux/if_tun.h>
+#else
+#include <net/if_utun.h>
+#include <sys/sys_domain.h>
+#include <sys/kern_control.h>
+#endif
 #include <arpa/inet.h>
 
 #ifndef PyVarObject_HEAD_INIT
@@ -27,6 +33,42 @@ representing an error returned by a system call, similar to the value\n\
 accompanying os.error. See the module errno, which contains names for the\n\
 error codes defined by the underlying operating system.");
 
+#ifdef PLATFORM_DARWIN
+int open_tun(int unit) {
+    struct ctl_info ctlInfo;
+    strlcpy(ctlInfo.ctl_name, UTUN_CONTROL_NAME, sizeof(ctlInfo.ctl_name));
+
+    int fd;
+    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd < 0) {
+        perror("socket error");
+        return fd;
+    }
+
+    struct sockaddr_ctl sc;
+
+    if (ioctl(fd, CTLIOCGINFO, &ctlInfo) == -1) {
+        close(fd);
+        return -1;
+    }
+    sc.sc_id = ctlInfo.ctl_id;
+    sc.sc_len = sizeof(sc);
+    sc.sc_family = AF_SYSTEM;
+    sc.ss_sysaddr = AF_SYS_CONTROL;
+    sc.sc_unit = unit;
+    sc.sc_unit = sc.sc_unit > 0 ? sc.sc_unit : 0;
+
+    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    // set_nonblock (fd);
+    fcntl (fd, F_SETFL, O_NONBLOCK);
+    return fd;
+}
+#endif
+
 static void raise_error(const char* errmsg)
 {
     PyErr_SetString(pytun_error, errmsg);
@@ -37,7 +79,7 @@ static void raise_error_from_errno(void)
     PyErr_SetFromErrno(pytun_error);
 }
 
-static int if_ioctl(int cmd, struct ifreq* req)
+static int if_ioctl(unsigned long cmd, struct ifreq* req)
 {
     int ret;
     int sock;
@@ -75,11 +117,16 @@ typedef struct pytun_tuntap pytun_tuntap_t;
 static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* kwds)
 {
     pytun_tuntap_t* tuntap = NULL;
-    const char* name = "";
-    int flags = IFF_TUN;
+    const char* name;
+    int flags;
+#ifndef PLATFORM_DARWIN
+    flags = IFF_TUN;
     const char* dev = "/dev/net/tun";
+#else
+    const char* dev = "10";
+#endif
     char* kwlist[] = {"name", "flags", "dev", NULL};
-    int ret;
+    int ret=0;
     const char* errmsg = NULL;
     struct ifreq req;
 
@@ -87,7 +134,13 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
     {
         return NULL;
     }
+    tuntap = (pytun_tuntap_t*)type->tp_alloc(type, 0);
+    if (tuntap == NULL)
+    {
+        goto error;
+    }
 
+#ifndef PLATFORM_DARWIN
     /* Check flags value */
     if (!(flags & (IFF_TUN | IFF_TAP)))
     {
@@ -106,13 +159,6 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
         errmsg = "Interface name too long";
         goto error;
     }
-
-    tuntap = (pytun_tuntap_t*)type->tp_alloc(type, 0);
-    if (tuntap == NULL)
-    {
-        goto error;
-    }
-
     /* Open the TUN/TAP device */
     Py_BEGIN_ALLOW_THREADS
     tuntap->fd = open(dev, O_RDWR);
@@ -134,11 +180,29 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
     Py_BEGIN_ALLOW_THREADS
     ret = ioctl(tuntap->fd, TUNSETIFF, &req);
     Py_END_ALLOW_THREADS
+#else
+    char utun[10] = {};
+    long dev_index = strtol(dev, NULL, 0);
+    if (!dev_index){
+        errmsg = "dev must be unit index\n";
+        goto error;
+    }
+    sprintf(utun, "utun%d\0", dev_index);
+    name = utun;
+    Py_BEGIN_ALLOW_THREADS
+        tuntap->fd = open_tun(dev_index+1);
+    Py_END_ALLOW_THREADS
+    if (tuntap->fd < 0)
+    {
+        goto error;
+    }
+#endif
+    /* Open the TUN/TAP device */
     if (ret < 0)
     {
         goto error;
     }
-    strcpy(tuntap->name, req.ifr_name);
+    strcpy(tuntap->name, name);
 
     return (PyObject*)tuntap;
 
@@ -217,51 +281,79 @@ static PyObject* pytun_tuntap_get_addr(PyObject* self, void* d)
 #endif
 }
 
-static int pytun_tuntap_set_addr(PyObject* self, PyObject* value, void* d)
+#define IN_GETADDR(addr, sin) \
+if (in_getaddr(addr, sin) < 0)\
+{\
+raise_error("Bad IP address");\
+ret = -1;\
+}
+
+#define IF_IOCTL(cmd, req) \
+if (if_ioctl(cmd, &req) < 0)\
+{\
+    ret = -1;\
+}
+
+int
+in_getaddr(const char *s, struct sockaddr_in *sin)
 {
+
+    sin->sin_len = sizeof(*sin);
+    sin->sin_family = AF_INET;
+
+    if (inet_aton(s, &sin->sin_addr)) return 0;
+    else return -1;
+}
+
+static PyObject*
+ pytun_tuntap_set(PyObject* self, PyObject* args, PyObject* kwds){
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
-    int ret = 0;
-    struct ifreq req;
-#if PY_MAJOR_VERSION >= 3
-    PyObject* tmp_addr;
-#endif
     const char* addr;
+    const char* dstaddr;
+    int mtu = 1500;
+    const char* netmask;
+    const char* hwaddr;
+    char* kwlist[] = {"addr", "dstaddr", "netmask", "mtu", "hwaddr", NULL};
+    int ret=0;
+    const char* errmsg = NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|sssis", kwlist,
+            &addr, &dstaddr, &netmask, &mtu, &hwaddr))
+    {
+        Py_RETURN_NONE;
+    }
     struct sockaddr_in* sin;
 
-#if PY_MAJOR_VERSION >= 3
-    tmp_addr = PyUnicode_AsASCIIString(value);
-    addr = tmp_addr != NULL ? PyBytes_AS_STRING(tmp_addr) : NULL;
-#else
-    addr = PyString_AsString(value);
-#endif
     if (addr == NULL)
     {
         ret = -1;
-        goto out;
     }
+#ifdef PLATFORM_DARWIN
+    struct	ifaliasreq	addreq = {};
+    strncpy((char*)&addreq, tuntap->name, sizeof addreq.ifra_name);
+    IN_GETADDR(addr, (struct sockaddr_in *)&addreq.ifra_addr);
+    IN_GETADDR(netmask, (struct sockaddr_in *)&addreq.ifra_mask);
+    IN_GETADDR(dstaddr, (struct sockaddr_in *)&addreq.ifra_broadaddr);
+    IF_IOCTL(SIOCAIFADDR, addreq);
+#else
+    struct ifreq req;
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
     sin = (struct sockaddr_in*)&req.ifr_addr;
-    sin->sin_family = AF_INET;
-    if (inet_aton(addr, &sin->sin_addr) == 0)
-    {
-        raise_error("Bad IP address");
-        ret = -1;
-        goto out;
-    }
-    if (if_ioctl(SIOCSIFADDR, &req) < 0)
-    {
-        ret = -1;
-        goto out;
-    }
-
-out:
-#if PY_MAJOR_VERSION >= 3
-    Py_XDECREF(tmp_addr);
+    IN_GETADDR(addr, sin);
+    IF_IOCTL(SIOCSIFADDR, req);
+    IN_GETADDR(dstaddr, sin);
+    IF_IOCTL(SIOCSIFDSTADDR, req);
+    IN_GETADDR(netmask, sin);
+    IF_IOCTL(SIOCSIFNETMASK, req);
 #endif
-
-    return ret;
+    if (ret < 0){
+        perror("config error");
+        return NULL;
+    }
+    Py_RETURN_NONE;
 }
+
 
 static PyObject* pytun_tuntap_get_dstaddr(PyObject* self, void* d)
 {
@@ -289,52 +381,7 @@ static PyObject* pytun_tuntap_get_dstaddr(PyObject* self, void* d)
 #endif
 }
 
-static int pytun_tuntap_set_dstaddr(PyObject* self, PyObject* value, void* d)
-{
-    pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
-    int ret = 0;
-    struct ifreq req;
-#if PY_MAJOR_VERSION >= 3
-    PyObject* tmp_dstaddr;
-#endif
-    const char* dstaddr;
-    struct sockaddr_in* sin;
-
-#if PY_MAJOR_VERSION >= 3
-    tmp_dstaddr = PyUnicode_AsASCIIString(value);
-    dstaddr = tmp_dstaddr != NULL ? PyBytes_AS_STRING(tmp_dstaddr) : NULL;
-#else
-    dstaddr = PyString_AsString(value);
-#endif
-    if (dstaddr == NULL)
-    {
-        ret = -1;
-        goto out;
-    }
-    memset(&req, 0, sizeof(req));
-    strcpy(req.ifr_name, tuntap->name);
-    sin = (struct sockaddr_in*)&req.ifr_dstaddr;
-    sin->sin_family = AF_INET;
-    if (inet_aton(dstaddr, &sin->sin_addr) == 0)
-    {
-        raise_error("Bad IP address");
-        ret = -1;
-        goto out;
-    }
-    if (if_ioctl(SIOCSIFDSTADDR, &req) < 0)
-    {
-        ret = -1;
-        goto out;
-    }
-
-out:
-#if PY_MAJOR_VERSION >= 3
-    Py_XDECREF(tmp_dstaddr);
-#endif
-
-    return ret;
-}
-
+#ifndef PLATFORM_DARWIN
 static PyObject* pytun_tuntap_get_hwaddr(PyObject* self, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -353,7 +400,9 @@ static PyObject* pytun_tuntap_get_hwaddr(PyObject* self, void* d)
     return PyString_FromStringAndSize(req.ifr_hwaddr.sa_data, ETH_ALEN);
 #endif
 }
+#endif
 
+#ifndef PLATFORM_DARWIN
 static int pytun_tuntap_set_hwaddr(PyObject* self, PyObject* value, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -385,7 +434,9 @@ static int pytun_tuntap_set_hwaddr(PyObject* self, PyObject* value, void* d)
 
     return 0;
 }
+#endif
 
+#ifndef PLATFORM_DARWIN
 static PyObject* pytun_tuntap_get_netmask(PyObject* self, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -411,52 +462,7 @@ static PyObject* pytun_tuntap_get_netmask(PyObject* self, void* d)
     return PyString_FromString(netmask);
 #endif
 }
-
-static int pytun_tuntap_set_netmask(PyObject* self, PyObject* value, void* d)
-{
-    pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
-    int ret = 0;
-    struct ifreq req;
-#if PY_MAJOR_VERSION >= 3
-    PyObject* tmp_netmask;
 #endif
-    const char* netmask;
-    struct sockaddr_in* sin;
-
-#if PY_MAJOR_VERSION >= 3
-    tmp_netmask = PyUnicode_AsASCIIString(value);
-    netmask = tmp_netmask != NULL ? PyBytes_AS_STRING(tmp_netmask) : NULL;
-#else
-    netmask = PyString_AsString(value);
-#endif
-    if (netmask == NULL)
-    {
-        ret = -1;
-        goto out;
-    }
-    memset(&req, 0, sizeof(req));
-    strcpy(req.ifr_name, tuntap->name);
-    sin = (struct sockaddr_in*)&req.ifr_netmask;
-    sin->sin_family = AF_INET;
-    if (inet_aton(netmask, &sin->sin_addr) == 0)
-    {
-        raise_error("Bad IP address");
-        ret = -1;
-        goto out;
-    }
-    if (if_ioctl(SIOCSIFNETMASK, &req) < 0)
-    {
-        ret = -1;
-        goto out;
-    }
-
-out:
-#if PY_MAJOR_VERSION >= 3
-    Py_XDECREF(tmp_netmask);
-#endif
-
-    return ret;
-}
 
 static PyObject* pytun_tuntap_get_mtu(PyObject* self, void* d)
 {
@@ -506,11 +512,13 @@ static int pytun_tuntap_set_mtu(PyObject* self, PyObject* value, void* d)
 static PyGetSetDef pytun_tuntap_prop[] =
 {
     {"name", pytun_tuntap_get_name, NULL, NULL, NULL},
-    {"addr", pytun_tuntap_get_addr, pytun_tuntap_set_addr, NULL, NULL},
-    {"dstaddr", pytun_tuntap_get_dstaddr, pytun_tuntap_set_dstaddr, NULL, NULL},
-    {"hwaddr", pytun_tuntap_get_hwaddr, pytun_tuntap_set_hwaddr, NULL, NULL},
-    {"netmask", pytun_tuntap_get_netmask, pytun_tuntap_set_netmask, NULL, NULL},
-    {"mtu", pytun_tuntap_get_mtu, pytun_tuntap_set_mtu, NULL, NULL},
+    {"addr", pytun_tuntap_get_addr, NULL, NULL, NULL},
+    {"dstaddr", pytun_tuntap_get_dstaddr, NULL, NULL, NULL},
+#ifndef PLATFORM_DARWIN
+    {"hwaddr", pytun_tuntap_get_hwaddr, NULL, NULL, NULL},
+    {"netmask", pytun_tuntap_get_netmask, NULL, NULL, NULL},
+#endif
+    {"mtu", pytun_tuntap_get_mtu, NULL, NULL, NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -686,6 +694,7 @@ PyDoc_STRVAR(pytun_tuntap_fileno_doc,
 
 static PyObject* pytun_tuntap_persist(PyObject* self, PyObject* args)
 {
+#ifndef PLATFORM_DARWIN
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
     PyObject* tmp = NULL;
     int persist;
@@ -713,12 +722,16 @@ static PyObject* pytun_tuntap_persist(PyObject* self, PyObject* args)
         raise_error_from_errno();
         return NULL;
     }
-
+#endif
     Py_RETURN_NONE;
 }
 
 PyDoc_STRVAR(pytun_tuntap_persist_doc,
 "persist(flag) -> None \"Make the TUN/TAP persistent if flags is True else\n\
+make it non-persistent\"");
+
+PyDoc_STRVAR(pytun_tuntap_set_doc,
+             "persist(flag) -> None \"Make the TUN/TAP persistent if flags is True else\n\
 make it non-persistent\"");
 
 static PyMethodDef pytun_tuntap_meth[] =
@@ -730,6 +743,7 @@ static PyMethodDef pytun_tuntap_meth[] =
     {"write", (PyCFunction)pytun_tuntap_write, METH_VARARGS, pytun_tuntap_write_doc},
     {"fileno", (PyCFunction)pytun_tuntap_fileno, METH_NOARGS, pytun_tuntap_fileno_doc},
     {"persist", (PyCFunction)pytun_tuntap_persist, METH_VARARGS, pytun_tuntap_persist_doc},
+    {"set", (PyCFunction)pytun_tuntap_set, METH_VARARGS|METH_KEYWORDS, pytun_tuntap_set_doc},
     {NULL, NULL, 0, NULL}
 };
 
@@ -816,6 +830,7 @@ PyMODINIT_FUNC initpytun(void)
         goto error;
     }
 
+#ifndef PLATFORM_DARWIN
     if (PyModule_AddIntConstant(m, "IFF_TUN", IFF_TUN) != 0)
     {
         goto error;
@@ -824,6 +839,7 @@ PyMODINIT_FUNC initpytun(void)
     {
         goto error;
     }
+#endif
 #ifdef IFF_NO_PI
     if (PyModule_AddIntConstant(m, "IFF_NO_PI", IFF_NO_PI) != 0)
     {
