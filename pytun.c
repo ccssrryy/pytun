@@ -63,8 +63,6 @@ int open_tun(int unit) {
         return -1;
     }
 
-    // set_nonblock (fd);
-    fcntl (fd, F_SETFL, O_NONBLOCK);
     return fd;
 }
 #endif
@@ -680,6 +678,22 @@ static PyObject* pytun_tuntap_write(PyObject* self, PyObject* args)
 PyDoc_STRVAR(pytun_tuntap_write_doc,
 "write(str) -> number of bytes written. Write str to device.");
 
+static PyObject* pytun_tuntap_setblocking(PyObject* self, PyObject* args){
+    pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
+    unsigned char blocking = 0;
+    if (!PyArg_ParseTuple(args, "B", &blocking))
+    {
+        return NULL;
+    }
+    Py_BEGIN_ALLOW_THREADS
+    if(fcntl(tuntap->fd, F_SETFL, blocking?0:O_NONBLOCK) < 0){
+        raise_error("set fd blocking state fail\n");
+        return NULL;
+    };
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
 static PyObject* pytun_tuntap_fileno(PyObject* self)
 {
 #if PY_MAJOR_VERSION >= 3
@@ -691,6 +705,9 @@ static PyObject* pytun_tuntap_fileno(PyObject* self)
 
 PyDoc_STRVAR(pytun_tuntap_fileno_doc,
 "fileno() -> integer \"file descriptor\"");
+
+PyDoc_STRVAR(pytun_tuntap_setblocking_doc,
+             "setlocking(blocking) -> None");
 
 static PyObject* pytun_tuntap_persist(PyObject* self, PyObject* args)
 {
@@ -731,8 +748,7 @@ PyDoc_STRVAR(pytun_tuntap_persist_doc,
 make it non-persistent\"");
 
 PyDoc_STRVAR(pytun_tuntap_set_doc,
-             "persist(flag) -> None \"Make the TUN/TAP persistent if flags is True else\n\
-make it non-persistent\"");
+             "set(addr, dstaddr, netmask, mtu, hwaddr) -> None \"Set params once\n");
 
 static PyMethodDef pytun_tuntap_meth[] =
 {
@@ -742,6 +758,7 @@ static PyMethodDef pytun_tuntap_meth[] =
     {"read", (PyCFunction)pytun_tuntap_read, METH_VARARGS, pytun_tuntap_read_doc},
     {"write", (PyCFunction)pytun_tuntap_write, METH_VARARGS, pytun_tuntap_write_doc},
     {"fileno", (PyCFunction)pytun_tuntap_fileno, METH_NOARGS, pytun_tuntap_fileno_doc},
+    {"setblocking", (PyCFunction)pytun_tuntap_setblocking, METH_VARARGS, pytun_tuntap_setblocking_doc},
     {"persist", (PyCFunction)pytun_tuntap_persist, METH_VARARGS, pytun_tuntap_persist_doc},
     {"set", (PyCFunction)pytun_tuntap_set, METH_VARARGS|METH_KEYWORDS, pytun_tuntap_set_doc},
     {NULL, NULL, 0, NULL}
