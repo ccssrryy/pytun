@@ -10,12 +10,12 @@
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <net/ethernet.h>
-#ifndef PLATFORM_DARWIN
-#include <linux/if_tun.h>
-#else
+#if PLATFORM_DARWIN
 #include <net/if_utun.h>
 #include <sys/sys_domain.h>
 #include <sys/kern_control.h>
+#else
+#include <linux/if_tun.h>
 #endif
 #include <arpa/inet.h>
 
@@ -33,9 +33,12 @@ representing an error returned by a system call, similar to the value\n\
 accompanying os.error. See the module errno, which contains names for the\n\
 error codes defined by the underlying operating system.");
 
-#ifdef PLATFORM_DARWIN
+#if PLATFORM_DARWIN
+#define IFF_TUN 1
+#define IFF_NO_PI 2
+
 int open_tun(int unit) {
-    struct ctl_info ctlInfo;
+    struct ctl_info ctlInfo = {};
     strlcpy(ctlInfo.ctl_name, UTUN_CONTROL_NAME, sizeof(ctlInfo.ctl_name));
 
     int fd;
@@ -45,7 +48,7 @@ int open_tun(int unit) {
         return fd;
     }
 
-    struct sockaddr_ctl sc;
+    struct sockaddr_ctl sc = {};
 
     if (ioctl(fd, CTLIOCGINFO, &ctlInfo) == -1) {
         close(fd);
@@ -108,6 +111,7 @@ struct pytun_tuntap
 {
     PyObject_HEAD
     int fd;
+    int flags;
     char name[IFNAMSIZ];
 };
 typedef struct pytun_tuntap pytun_tuntap_t;
@@ -117,11 +121,11 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
     pytun_tuntap_t* tuntap = NULL;
     const char* name;
     int flags;
-#ifndef PLATFORM_DARWIN
+#if PLATFORM_DARWIN
+    const char* dev = "10";
+#else
     flags = IFF_TUN;
     const char* dev = "/dev/net/tun";
-#else
-    const char* dev = "10";
 #endif
     char* kwlist[] = {"name", "flags", "dev", NULL};
     int ret=0;
@@ -137,8 +141,9 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
     {
         goto error;
     }
+    tuntap->flags = flags;
 
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
     /* Check flags value */
     if (!(flags & (IFF_TUN | IFF_TAP)))
     {
@@ -296,7 +301,9 @@ int
 in_getaddr(const char *s, struct sockaddr_in *sin)
 {
 
+#if PLATFORM_DARWIN
     sin->sin_len = sizeof(*sin);
+#endif
     sin->sin_family = AF_INET;
 
     if (inet_aton(s, &sin->sin_addr)) return 0;
@@ -318,6 +325,7 @@ static PyObject*
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|sssis", kwlist,
             &addr, &dstaddr, &netmask, &mtu, &hwaddr))
     {
+        Py_INCREF(Py_None);
         Py_RETURN_NONE;
     }
     struct sockaddr_in* sin;
@@ -326,7 +334,7 @@ static PyObject*
     {
         ret = -1;
     }
-#ifdef PLATFORM_DARWIN
+#if PLATFORM_DARWIN
     struct	ifaliasreq	addreq = {};
     strncpy((char*)&addreq, tuntap->name, sizeof addreq.ifra_name);
     IN_GETADDR(addr, (struct sockaddr_in *)&addreq.ifra_addr);
@@ -349,6 +357,7 @@ static PyObject*
         perror("config error");
         return NULL;
     }
+    Py_INCREF(Py_None);
     Py_RETURN_NONE;
 }
 
@@ -379,7 +388,7 @@ static PyObject* pytun_tuntap_get_dstaddr(PyObject* self, void* d)
 #endif
 }
 
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
 static PyObject* pytun_tuntap_get_hwaddr(PyObject* self, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -400,7 +409,7 @@ static PyObject* pytun_tuntap_get_hwaddr(PyObject* self, void* d)
 }
 #endif
 
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
 static int pytun_tuntap_set_hwaddr(PyObject* self, PyObject* value, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -434,7 +443,7 @@ static int pytun_tuntap_set_hwaddr(PyObject* self, PyObject* value, void* d)
 }
 #endif
 
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
 static PyObject* pytun_tuntap_get_netmask(PyObject* self, void* d)
 {
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
@@ -512,7 +521,7 @@ static PyGetSetDef pytun_tuntap_prop[] =
     {"name", pytun_tuntap_get_name, NULL, NULL, NULL},
     {"addr", pytun_tuntap_get_addr, NULL, NULL, NULL},
     {"dstaddr", pytun_tuntap_get_dstaddr, NULL, NULL, NULL},
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
     {"hwaddr", pytun_tuntap_get_hwaddr, NULL, NULL, NULL},
     {"netmask", pytun_tuntap_get_netmask, NULL, NULL, NULL},
 #endif
@@ -601,32 +610,37 @@ static PyObject* pytun_tuntap_read(PyObject* self, PyObject* args)
         return NULL;
     }
 
-    /* Allocate a new string */
-#if PY_MAJOR_VERSION >= 3
-    buf = PyBytes_FromStringAndSize(NULL, rdlen);
-#else
-    buf = PyString_FromStringAndSize(NULL, rdlen);
-#endif
-    if (buf == NULL)
-    {
-        return NULL;
+/* additional 4 bytes */
+    int ad_bytes = 0;
+#if PLATFORM_DARWIN
+    if (IFF_NO_PI & tuntap->flags){
+        ad_bytes = 4;
     }
-
-    /* Read data */
-    Py_BEGIN_ALLOW_THREADS
-#if PY_MAJOR_VERSION >= 3
-    outlen = read(tuntap->fd, PyBytes_AS_STRING(buf), rdlen);
-#else
-    outlen = read(tuntap->fd, PyString_AS_STRING(buf), rdlen);
 #endif
+
+    /* Allocate a new string */
+    /* Read data */
+    char rd_data[rdlen + ad_bytes];
+
+    Py_BEGIN_ALLOW_THREADS
+    outlen = read(tuntap->fd, rd_data, rdlen + ad_bytes);
+
+    outlen -= ad_bytes;
     Py_END_ALLOW_THREADS
     if (outlen < 0)
     {
-        /* An error occurred, release the string and return an error */
-        raise_error_from_errno();
-        Py_DECREF(buf);
-        return NULL;
+        goto err;
     }
+#if PY_MAJOR_VERSION >= 3
+    buf = PyBytes_FromStringAndSize(rd_data + ad_bytes, rdlen);
+#else
+    buf = PyString_FromStringAndSize(rd_data + ad_bytes, rdlen);
+#endif
+    if (buf == NULL)
+    {
+        goto err;
+    }
+
     if (outlen < rdlen)
     {
         /* We did not read as many bytes as we anticipated, resize the
@@ -637,11 +651,15 @@ static PyObject* pytun_tuntap_read(PyObject* self, PyObject* args)
         if (_PyString_Resize(&buf, outlen) < 0)
 #endif
         {
-            return NULL;
+            Py_XDECREF(buf);
+            goto err;
         }
     }
 
     return buf;
+err:
+    raise_error_from_errno();
+    return NULL;
 }
 
 PyDoc_STRVAR(pytun_tuntap_read_doc,
@@ -659,9 +677,37 @@ static PyObject* pytun_tuntap_write(PyObject* self, PyObject* args)
         return NULL;
     }
 
+
+#if PLATFORM_DARWIN
+    if (IFF_NO_PI & tuntap->flags){
+        int ip_version = buf[0] >> 4;
+        len += 4;
+        char alloc_buf[len];
+        alloc_buf[0] = 0;
+        alloc_buf[1] = 0;
+        alloc_buf[2] = 0;
+        if (ip_version == 4){
+            alloc_buf[3] = AF_INET;
+        }
+        else if(ip_version == 6){
+            alloc_buf[3] = AF_INET6;
+        }
+        else{
+            raise_error("wrong ip version of data!");
+            return NULL;
+        }
+        memcpy(alloc_buf+4, buf, len);
+        Py_BEGIN_ALLOW_THREADS
+            written = write(tuntap->fd, alloc_buf, len);
+        Py_END_ALLOW_THREADS
+        goto wr;
+    }
+#endif
+
     Py_BEGIN_ALLOW_THREADS
     written = write(tuntap->fd, buf, len);
     Py_END_ALLOW_THREADS
+wr:
     if (written < 0)
     {
         raise_error_from_errno();
@@ -711,7 +757,7 @@ PyDoc_STRVAR(pytun_tuntap_setblocking_doc,
 
 static PyObject* pytun_tuntap_persist(PyObject* self, PyObject* args)
 {
-#ifndef PLATFORM_DARWIN
+#if !PLATFORM_DARWIN
     pytun_tuntap_t* tuntap = (pytun_tuntap_t*)self;
     PyObject* tmp = NULL;
     int persist;
@@ -847,11 +893,11 @@ PyMODINIT_FUNC initpytun(void)
         goto error;
     }
 
-#ifndef PLATFORM_DARWIN
     if (PyModule_AddIntConstant(m, "IFF_TUN", IFF_TUN) != 0)
     {
         goto error;
     }
+#if !PLATFORM_DARWIN
     if (PyModule_AddIntConstant(m, "IFF_TAP", IFF_TAP) != 0)
     {
         goto error;
