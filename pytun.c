@@ -80,19 +80,9 @@ static void raise_error_from_errno(void)
     PyErr_SetFromErrno(pytun_error);
 }
 
-static int if_ioctl(unsigned long cmd, struct ifreq* req)
+static int if_ioctl(int sock, unsigned long cmd, struct ifreq* req)
 {
     int ret;
-    int sock;
-
-    Py_BEGIN_ALLOW_THREADS
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    Py_END_ALLOW_THREADS
-    if (sock < 0)
-    {
-        raise_error_from_errno();
-        return -1;
-    }
     Py_BEGIN_ALLOW_THREADS
     ret = ioctl(sock, cmd, req);
     Py_END_ALLOW_THREADS
@@ -100,10 +90,6 @@ static int if_ioctl(unsigned long cmd, struct ifreq* req)
     {
         raise_error_from_errno();
     }
-    Py_BEGIN_ALLOW_THREADS
-    close(sock);
-    Py_END_ALLOW_THREADS
-
     return ret;
 }
 
@@ -113,6 +99,7 @@ struct pytun_tuntap
     int fd;
     int flags;
     char name[IFNAMSIZ];
+    int _sock; // cache for if_ioctl
 };
 typedef struct pytun_tuntap pytun_tuntap_t;
 
@@ -207,6 +194,16 @@ static PyObject* pytun_tuntap_new(PyTypeObject* type, PyObject* args, PyObject* 
     }
     strcpy(tuntap->name, name);
 
+    int sock;
+    Py_BEGIN_ALLOW_THREADS
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    Py_END_ALLOW_THREADS
+    tuntap->_sock = sock;
+    if (sock < 0)
+    {
+        goto error;
+    }
+
     return (PyObject*)tuntap;
 
 error:
@@ -244,6 +241,12 @@ static void pytun_tuntap_dealloc(PyObject* self)
         close(tuntap->fd);
         Py_END_ALLOW_THREADS
     }
+    if (tuntap->_sock >= 0)
+    {
+        Py_BEGIN_ALLOW_THREADS
+        close(tuntap->_sock);
+        Py_END_ALLOW_THREADS
+    }
     self->ob_type->tp_free(self);
 }
 
@@ -266,7 +269,7 @@ static PyObject* pytun_tuntap_get_addr(PyObject* self, void* d)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFADDR, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFADDR, &req) < 0)
     {
         return NULL;
     }
@@ -291,8 +294,8 @@ raise_error("Bad IP address");\
 ret = -1;\
 }
 
-#define IF_IOCTL(cmd, req) \
-if (if_ioctl(cmd, &req) < 0)\
+#define IF_IOCTL(sock, cmd, req) \
+if (if_ioctl(sock, cmd, &req) < 0)\
 {\
     ret = -1;\
 }
@@ -340,18 +343,18 @@ static PyObject*
     IN_GETADDR(addr, (struct sockaddr_in *)&addreq.ifra_addr);
     IN_GETADDR(netmask, (struct sockaddr_in *)&addreq.ifra_mask);
     IN_GETADDR(dstaddr, (struct sockaddr_in *)&addreq.ifra_broadaddr);
-    IF_IOCTL(SIOCAIFADDR, addreq);
+    IF_IOCTL(tuntap->_sock, SIOCAIFADDR, addreq);
 #else
     struct ifreq req;
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
     sin = (struct sockaddr_in*)&req.ifr_addr;
     IN_GETADDR(addr, sin);
-    IF_IOCTL(SIOCSIFADDR, req);
+    IF_IOCTL(tuntap->_sock, SIOCSIFADDR, req);
     IN_GETADDR(dstaddr, sin);
-    IF_IOCTL(SIOCSIFDSTADDR, req);
+    IF_IOCTL(tuntap->_sock, SIOCSIFDSTADDR, req);
     IN_GETADDR(netmask, sin);
-    IF_IOCTL(SIOCSIFNETMASK, req);
+    IF_IOCTL(tuntap->_sock, SIOCSIFNETMASK, req);
 #endif
     if (ret < 0){
         perror("config error");
@@ -370,7 +373,7 @@ static PyObject* pytun_tuntap_get_dstaddr(PyObject* self, void* d)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFDSTADDR, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFDSTADDR, &req) < 0)
     {
         return NULL;
     }
@@ -396,7 +399,7 @@ static PyObject* pytun_tuntap_get_hwaddr(PyObject* self, void* d)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFHWADDR, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFHWADDR, &req) < 0)
     {
         return NULL;
     }
@@ -434,7 +437,7 @@ static int pytun_tuntap_set_hwaddr(PyObject* self, PyObject* value, void* d)
     strcpy(req.ifr_name, tuntap->name);
     req.ifr_hwaddr.sa_family = ARPHRD_ETHER;
     memcpy(req.ifr_hwaddr.sa_data, hwaddr, len);
-    if (if_ioctl(SIOCSIFHWADDR, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCSIFHWADDR, &req) < 0)
     {
         return -1;
     }
@@ -452,7 +455,7 @@ static PyObject* pytun_tuntap_get_netmask(PyObject* self, void* d)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFNETMASK, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFNETMASK, &req) < 0)
     {
         return NULL;
     }
@@ -478,7 +481,7 @@ static PyObject* pytun_tuntap_get_mtu(PyObject* self, void* d)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFMTU, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFMTU, &req) < 0)
     {
         return NULL;
     }
@@ -508,7 +511,7 @@ static int pytun_tuntap_set_mtu(PyObject* self, PyObject* value, void* d)
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
     req.ifr_mtu = mtu;
-    if (if_ioctl(SIOCSIFMTU, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCSIFMTU, &req) < 0)
     {
         return -1;
     }
@@ -553,14 +556,14 @@ static PyObject* pytun_tuntap_up(PyObject* self)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFFLAGS, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFFLAGS, &req) < 0)
     {
         return NULL;
     }
     if (!(req.ifr_flags & IFF_UP))
     {
         req.ifr_flags |= IFF_UP;
-        if (if_ioctl(SIOCSIFFLAGS, &req) < 0)
+        if (if_ioctl(tuntap->_sock, SIOCSIFFLAGS, &req) < 0)
         {
             return NULL;
         }
@@ -579,14 +582,14 @@ static PyObject* pytun_tuntap_down(PyObject* self)
 
     memset(&req, 0, sizeof(req));
     strcpy(req.ifr_name, tuntap->name);
-    if (if_ioctl(SIOCGIFFLAGS, &req) < 0)
+    if (if_ioctl(tuntap->_sock, SIOCGIFFLAGS, &req) < 0)
     {
         return NULL;
     }
     if (req.ifr_flags & IFF_UP)
     {
         req.ifr_flags &= ~IFF_UP;
-        if (if_ioctl(SIOCSIFFLAGS, &req) < 0)
+        if (if_ioctl(tuntap->_sock, SIOCSIFFLAGS, &req) < 0)
         {
             return NULL;
         }
