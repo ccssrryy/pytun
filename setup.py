@@ -3,6 +3,8 @@ import sys
 
 platform = sys.platform
 
+# on mac: ARCHFLAGS="-arch x86_64" python3 setup.py install
+
 setup(name='pytun',
       author='montag451',
       author_email='montag451@laposte.net',

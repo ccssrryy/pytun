@@ -700,6 +700,7 @@ static PyObject* pytun_tuntap_write(PyObject* self, PyObject* args)
         Py_BEGIN_ALLOW_THREADS
             written = write(tuntap->fd, alloc_buf, len);
         Py_END_ALLOW_THREADS
+        written = written > 4 ? written - 4 : written;
         goto wr;
     }
 #endif
